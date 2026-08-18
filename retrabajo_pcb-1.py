@@ -1,0 +1,1047 @@
+"""
+Sistema de Retrabajo y Clasificación de PCBs
+=============================================
+Reusa la logica de mapeo tipo "ajedrez" del remapeo_4.0.1.py, pero aplicada
+al flujo de retrabajo: escaneo con validacion de duplicados, cruce contra el
+Excel que regresa el ERP (modelo/proceso por Lot ID), vista de clasificacion
+por color (modelo o proceso) e historial persistente.
+
+Autor: prototipo generado con Claude para Guillermo.
+"""
+
+import os
+import sqlite3
+import string
+import tkinter as tk
+from datetime import datetime
+from tkinter import ttk, messagebox, filedialog
+
+import pandas as pd
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "retrabajo_pcb.db")
+
+# Paleta fija para que los colores sean consistentes entre sesiones.
+COLOR_PALETTE = [
+    "#4CAF50", "#2196F3", "#FF9800", "#9C27B0", "#F44336",
+    "#00BCD4", "#8BC34A", "#E91E63", "#3F51B5", "#FFC107",
+    "#795548", "#607D8B",
+]
+COLOR_PENDIENTE = "#D9D9D9"   # gris: sin escanear
+COLOR_ESCANEADO = "#A5D6A7"   # verde suave: escaneado, aun sin cruzar con Excel
+COLOR_SIN_MATCH = "#FFF176"   # amarillo: escaneado pero el Excel no trajo dato
+
+
+# --------------------------------------------------------------------------
+# Capa de datos
+# --------------------------------------------------------------------------
+class Database:
+    def __init__(self, path=DB_PATH):
+        self.conn = sqlite3.connect(path)
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self._crear_tablas()
+
+    def _crear_tablas(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS charolas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre TEXT UNIQUE,
+                filas INTEGER,
+                columnas INTEGER,
+                volteada INTEGER DEFAULT 0,
+                creada TEXT
+            )
+        """)
+        # Migracion suave por si la DB ya existia sin la columna 'volteada'
+        cur.execute("PRAGMA table_info(charolas)")
+        columnas_existentes = [c[1] for c in cur.fetchall()]
+        if "volteada" not in columnas_existentes:
+            cur.execute("ALTER TABLE charolas ADD COLUMN volteada INTEGER DEFAULT 0")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pcbs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                charola_id INTEGER,
+                posicion TEXT,
+                lot_id TEXT,
+                modelo TEXT,
+                proceso TEXT,
+                separada INTEGER DEFAULT 0,
+                escaneado_en TEXT,
+                actualizado_en TEXT,
+                FOREIGN KEY(charola_id) REFERENCES charolas(id),
+                UNIQUE(charola_id, posicion)
+            )
+        """)
+        cur.execute("PRAGMA table_info(pcbs)")
+        columnas_pcbs = [c[1] for c in cur.fetchall()]
+        if "separada" not in columnas_pcbs:
+            cur.execute("ALTER TABLE pcbs ADD COLUMN separada INTEGER DEFAULT 0")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS historial (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                evento TEXT,
+                detalle TEXT,
+                fecha TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS equivalencias_modelo (
+                modelo_variante TEXT PRIMARY KEY,
+                modelo_base TEXT
+            )
+        """)
+        self.conn.commit()
+
+    # --- charolas ---
+    def crear_charola(self, nombre, filas, columnas, volteada=0):
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO charolas (nombre, filas, columnas, volteada, creada) VALUES (?,?,?,?,?)",
+            (nombre, filas, columnas, int(volteada), datetime.now().isoformat(timespec="seconds")),
+        )
+        self.conn.commit()
+        etiqueta_volteo = " [volteada]" if volteada else ""
+        self.registrar_historial("charola_creada", f"{nombre} ({filas}x{columnas}){etiqueta_volteo}")
+        return cur.lastrowid
+
+    def listar_charolas(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, nombre, filas, columnas, volteada FROM charolas ORDER BY id DESC")
+        return cur.fetchall()
+
+    def obtener_charola(self, charola_id):
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, nombre, filas, columnas, volteada FROM charolas WHERE id=?", (charola_id,))
+        return cur.fetchone()
+
+    # --- pcbs / escaneo ---
+    def lot_id_ya_escaneado(self, lot_id):
+        """Valida duplicados en TODO el sistema, no solo en la charola actual."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT charola_id, posicion FROM pcbs WHERE lot_id=?", (lot_id,))
+        return cur.fetchone()
+
+    def posicion_ocupada(self, charola_id, posicion):
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT lot_id FROM pcbs WHERE charola_id=? AND posicion=?",
+            (charola_id, posicion),
+        )
+        return cur.fetchone()
+
+    def escanear(self, charola_id, posicion, lot_id):
+        cur = self.conn.cursor()
+        ahora = datetime.now().isoformat(timespec="seconds")
+        cur.execute(
+            """INSERT INTO pcbs (charola_id, posicion, lot_id, escaneado_en, actualizado_en)
+               VALUES (?,?,?,?,?)""",
+            (charola_id, posicion, lot_id, ahora, ahora),
+        )
+        self.conn.commit()
+        self.registrar_historial("pcb_escaneado", f"{lot_id} -> charola {charola_id} pos {posicion}")
+
+    def undo_ultimo_escaneo(self, charola_id, posicion):
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM pcbs WHERE charola_id=? AND posicion=?", (charola_id, posicion))
+        self.conn.commit()
+        self.registrar_historial("undo_escaneo", f"charola {charola_id} pos {posicion}")
+
+    def pcbs_de_charola(self, charola_id):
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT posicion, lot_id, modelo, proceso, separada FROM pcbs WHERE charola_id=?",
+            (charola_id,),
+        )
+        return {
+            row[0]: {"lot_id": row[1], "modelo": row[2], "proceso": row[3], "separada": bool(row[4])}
+            for row in cur.fetchall()
+        }
+
+    def marcar_separada(self, charola_id, posicion, valor=True):
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE pcbs SET separada=? WHERE charola_id=? AND posicion=?",
+            (int(bool(valor)), charola_id, posicion),
+        )
+        self.conn.commit()
+
+    def pcbs_agrupados_por_modelo(self, charola_id, usar_modelo_base=False):
+        """Para la lista de separacion: agrupa las piezas ya clasificadas por modelo.
+
+        Si usar_modelo_base=True, agrupa usando la tabla de equivalencias
+        (modelo_variante -> modelo_base). Si un modelo no tiene equivalencia
+        registrada, se agrupa tal cual viene del ERP (no se pierde ni se inventa nada).
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """SELECT posicion, lot_id, modelo, proceso, separada FROM pcbs
+               WHERE charola_id=? AND modelo IS NOT NULL
+               ORDER BY modelo, posicion""",
+            (charola_id,),
+        )
+        filas = cur.fetchall()
+
+        equivalencias = {}
+        if usar_modelo_base:
+            equivalencias = dict(self.listar_equivalencias())
+
+        grupos = {}
+        for pos, lot_id, modelo, proceso, separada in filas:
+            clave = equivalencias.get(modelo, modelo) if usar_modelo_base else modelo
+            grupos.setdefault(clave, []).append(
+                {
+                    "posicion": pos, "lot_id": lot_id, "modelo": modelo,
+                    "proceso": proceso, "separada": bool(separada),
+                }
+            )
+        return grupos
+
+    # --- equivalencias de modelo base ---
+    def agregar_equivalencia(self, variante, base):
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO equivalencias_modelo (modelo_variante, modelo_base) VALUES (?,?)",
+            (variante.strip(), base.strip()),
+        )
+        self.conn.commit()
+        self.registrar_historial("equivalencia_modelo", f"{variante} -> {base}")
+
+    def eliminar_equivalencia(self, variante):
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM equivalencias_modelo WHERE modelo_variante=?", (variante,))
+        self.conn.commit()
+        self.registrar_historial("equivalencia_eliminada", variante)
+
+    def listar_equivalencias(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT modelo_variante, modelo_base FROM equivalencias_modelo ORDER BY modelo_variante")
+        return cur.fetchall()
+
+    def actualizar_modelo_proceso(self, lot_id, modelo, proceso):
+        cur = self.conn.cursor()
+        ahora = datetime.now().isoformat(timespec="seconds")
+        cur.execute(
+            "UPDATE pcbs SET modelo=?, proceso=?, actualizado_en=? WHERE lot_id=?",
+            (modelo, proceso, ahora, lot_id),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def todos_los_lot_ids_pendientes_de_cruce(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT DISTINCT lot_id FROM pcbs WHERE modelo IS NULL")
+        return [r[0] for r in cur.fetchall()]
+
+    def todos_los_lot_ids(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT DISTINCT lot_id FROM pcbs")
+        return [r[0] for r in cur.fetchall()]
+
+    # --- historial ---
+    def registrar_historial(self, evento, detalle):
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO historial (evento, detalle, fecha) VALUES (?,?,?)",
+            (evento, detalle, datetime.now().isoformat(timespec="seconds")),
+        )
+        self.conn.commit()
+
+    def leer_historial(self, limite=200):
+        cur = self.conn.cursor()
+        cur.execute("SELECT evento, detalle, fecha FROM historial ORDER BY id DESC LIMIT ?", (limite,))
+        return cur.fetchall()
+
+
+# --------------------------------------------------------------------------
+# Utilidades de mapeo tipo ajedrez
+# --------------------------------------------------------------------------
+def etiqueta_columna(idx):
+    """0 -> A, 1 -> B ... 25 -> Z, 26 -> AA ..."""
+    letras = string.ascii_uppercase
+    resultado = ""
+    idx += 1
+    while idx > 0:
+        idx, resto = divmod(idx - 1, 26)
+        resultado = letras[resto] + resultado
+    return resultado
+
+
+def generar_posiciones(filas, columnas):
+    """Genera posiciones canonicas tipo ajedrez recorriendo fila por fila."""
+    posiciones = []
+    for f in range(filas):
+        for c in range(columnas):
+            posiciones.append(f"{etiqueta_columna(c)}{f + 1}")
+    return posiciones
+
+
+def voltear_posicion(pos, filas):
+    """
+    Traduce una posicion cuando la charola se voltea 180 grados de arriba-abajo
+    para escanear el QR que queda boca abajo (tipico en charolas de 36).
+
+    La columna se mantiene igual; la fila se invierte:
+        fila_nueva = (filas + 1) - fila_original
+    Ej. con 6 filas: A1 <-> A6, C3 <-> C4, C5 <-> C2.
+    """
+    col_letra = "".join(ch for ch in pos if ch.isalpha())
+    fila_num = int("".join(ch for ch in pos if ch.isdigit()))
+    fila_nueva = (filas + 1) - fila_num
+    return f"{col_letra}{fila_nueva}"
+
+
+def orden_escaneo(filas, columnas, volteada):
+    """
+    Devuelve la lista de posiciones CANONICAS en el orden real en que se van
+    llenando conforme el operador escanea fisicamente la charola.
+
+    Si la charola esta volteada, el operador recorre la charola en su orden
+    fisico normal (fila por fila) pero cada pieza que toca en realidad
+    corresponde a la posicion canonica opuesta verticalmente.
+    """
+    fisico = generar_posiciones(filas, columnas)
+    if not volteada:
+        return fisico
+    return [voltear_posicion(p, filas) for p in fisico]
+
+
+# --------------------------------------------------------------------------
+# UI
+# --------------------------------------------------------------------------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Retrabajo y Clasificacion de PCBs")
+        self.geometry("1150x720")
+        self.db = Database()
+
+        self.charola_actual_id = None
+        self.filas = 6
+        self.columnas = 6
+        self.volteada_actual = 0
+        self.orden_estricto = tk.BooleanVar(value=False)
+        self.vista_color = tk.StringVar(value="proceso")  # "modelo" | "proceso"
+        self.celdas = {}  # posicion -> tk.Label
+        self.color_map_modelo = {}
+        self.color_map_proceso = {}
+
+        self._construir_ui()
+
+    # ---------------- UI construction ----------------
+    def _construir_ui(self):
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True)
+
+        self.tab_escaneo = ttk.Frame(notebook)
+        self.tab_clasificacion = ttk.Frame(notebook)
+        self.tab_separacion = ttk.Frame(notebook)
+        self.tab_modelos_base = ttk.Frame(notebook)
+        self.tab_historial = ttk.Frame(notebook)
+
+        notebook.add(self.tab_escaneo, text="Escaneo")
+        notebook.add(self.tab_clasificacion, text="Clasificacion / Excel")
+        notebook.add(self.tab_separacion, text="Separacion")
+        notebook.add(self.tab_modelos_base, text="Modelos base")
+        notebook.add(self.tab_historial, text="Historial")
+
+        self._construir_tab_escaneo()
+        self._construir_tab_clasificacion()
+        self._construir_tab_separacion()
+        self._construir_tab_modelos_base()
+        self._construir_tab_historial()
+
+    def _construir_tab_escaneo(self):
+        top = ttk.Frame(self.tab_escaneo)
+        top.pack(fill="x", padx=10, pady=8)
+
+        ttk.Label(top, text="Charola:").grid(row=0, column=0, sticky="w")
+        self.combo_charola = ttk.Combobox(top, width=30, state="readonly")
+        self.combo_charola.grid(row=0, column=1, padx=5)
+        self.combo_charola.bind("<<ComboboxSelected>>", self._on_seleccionar_charola)
+
+        ttk.Button(top, text="Nueva charola", command=self._dialogo_nueva_charola).grid(row=0, column=2, padx=5)
+        ttk.Checkbutton(top, text="Forzar orden estricto de escaneo", variable=self.orden_estricto).grid(
+            row=0, column=3, padx=15
+        )
+
+        entry_frame = ttk.Frame(self.tab_escaneo)
+        entry_frame.pack(fill="x", padx=10, pady=4)
+        ttk.Label(entry_frame, text="Escanear Lot ID:").pack(side="left")
+        self.entry_lot_id = ttk.Entry(entry_frame, width=35)
+        self.entry_lot_id.pack(side="left", padx=6)
+        self.entry_lot_id.bind("<Return>", lambda e: self._escanear())
+        ttk.Button(entry_frame, text="Escanear", command=self._escanear).pack(side="left", padx=4)
+        ttk.Button(entry_frame, text="Deshacer ultima celda", command=self._undo_celda).pack(side="left", padx=4)
+        ttk.Button(entry_frame, text="Copiar todos los Lot ID", command=self._copiar_lot_ids).pack(
+            side="left", padx=12
+        )
+
+        self.lbl_progreso = ttk.Label(self.tab_escaneo, text="0 / 0 posiciones escaneadas")
+        self.lbl_progreso.pack(anchor="w", padx=10)
+
+        self.frame_grid = ttk.Frame(self.tab_escaneo)
+        self.frame_grid.pack(padx=10, pady=10)
+
+        self._refrescar_combo_charolas()
+
+    def _construir_tab_clasificacion(self):
+        top = ttk.Frame(self.tab_clasificacion)
+        top.pack(fill="x", padx=10, pady=8)
+
+        ttk.Button(top, text="Importar Excel del ERP", command=self._importar_excel).pack(side="left")
+
+        ttk.Label(top, text="Ver por:").pack(side="left", padx=(20, 4))
+        ttk.Radiobutton(
+            top, text="Modelo", variable=self.vista_color, value="modelo", command=self._redibujar_grid
+        ).pack(side="left")
+        ttk.Radiobutton(
+            top, text="Proceso", variable=self.vista_color, value="proceso", command=self._redibujar_grid
+        ).pack(side="left")
+
+        self.lbl_import_status = ttk.Label(self.tab_clasificacion, text="Sin archivo importado todavia.")
+        self.lbl_import_status.pack(anchor="w", padx=10)
+
+        cuerpo = ttk.Frame(self.tab_clasificacion)
+        cuerpo.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.frame_leyenda = ttk.LabelFrame(cuerpo, text="Leyenda")
+        self.frame_leyenda.pack(side="right", fill="y", padx=(10, 0))
+
+    def _construir_tab_separacion(self):
+        top = ttk.Frame(self.tab_separacion)
+        top.pack(fill="x", padx=10, pady=8)
+
+        ttk.Label(top, text="Charola:").pack(side="left")
+        self.combo_charola_sep = ttk.Combobox(top, width=30, state="readonly")
+        self.combo_charola_sep.pack(side="left", padx=5)
+        self.combo_charola_sep.bind("<<ComboboxSelected>>", lambda e: self._refrescar_picking_list())
+        ttk.Button(top, text="Actualizar", command=self._refrescar_picking_list).pack(side="left", padx=5)
+
+        self.usar_modelo_base = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            top, text="Agrupar por modelo base (usa tabla de equivalencias)",
+            variable=self.usar_modelo_base, command=self._refrescar_picking_list,
+        ).pack(side="left", padx=15)
+
+        # --- Vista grafica tipo mapa (igual que Clasificacion, pero con esta charola) ---
+        barra_vista = ttk.Frame(self.tab_separacion)
+        barra_vista.pack(fill="x", padx=10, pady=(4, 0))
+        ttk.Label(barra_vista, text="Mapa de charola - ver por:").pack(side="left")
+        self.vista_color_sep = tk.StringVar(value="modelo")
+        ttk.Radiobutton(
+            barra_vista, text="Modelo", variable=self.vista_color_sep, value="modelo",
+            command=self._dibujar_grid_separacion,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            barra_vista, text="Proceso", variable=self.vista_color_sep, value="proceso",
+            command=self._dibujar_grid_separacion,
+        ).pack(side="left")
+
+        panel_mapa = ttk.Frame(self.tab_separacion)
+        panel_mapa.pack(fill="x", padx=10, pady=6)
+        self.frame_grid_separacion = ttk.Frame(panel_mapa)
+        self.frame_grid_separacion.pack(side="left")
+        self.frame_leyenda_sep = ttk.LabelFrame(panel_mapa, text="Leyenda")
+        self.frame_leyenda_sep.pack(side="left", padx=15, fill="y")
+
+        ttk.Label(
+            self.tab_separacion,
+            text=(
+                "Marca cada pieza conforme la muevas fisicamente a su charola de destino por modelo. "
+                "El check se guarda al instante."
+            ),
+            foreground="#555555",
+        ).pack(anchor="w", padx=10, pady=(0, 6))
+
+        # Area con scroll para las listas de picking por modelo
+        contenedor = ttk.Frame(self.tab_separacion)
+        contenedor.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        canvas = tk.Canvas(contenedor, borderwidth=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(contenedor, orient="vertical", command=canvas.yview)
+        self.frame_picking = ttk.Frame(canvas)
+        self.frame_picking.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=self.frame_picking, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.canvas_picking = canvas
+
+    def _dibujar_grid_separacion(self):
+        """Dibuja el mapa visual de charola en Separacion, mostrando modelo/proceso por celda."""
+        for w in self.frame_grid_separacion.winfo_children():
+            w.destroy()
+
+        seleccion = self.combo_charola_sep.get()
+        if not seleccion or self.charola_actual_id != int(seleccion.split(" - ")[0]):
+            return
+
+        charola_id = self.charola_actual_id
+        filas, columnas = self.filas, self.columnas
+        volteada = self.volteada_actual
+        criterio = self.vista_color_sep.get()
+
+        datos = self.db.pcbs_de_charola(charola_id)
+        posiciones = generar_posiciones(filas, columnas)
+
+        # generar mapas de color
+        color_map = {}
+        for pos, info in datos.items():
+            valor = info.get(criterio)
+            if valor and valor not in color_map:
+                color_map[valor] = COLOR_PALETTE[len(color_map) % len(COLOR_PALETTE)]
+
+        # encabezados columna
+        for c in range(columnas):
+            ttk.Label(self.frame_grid_separacion, text=etiqueta_columna(c), width=12, anchor="center").grid(
+                row=0, column=c + 1
+            )
+        for f in range(filas):
+            ttk.Label(self.frame_grid_separacion, text=str(f + 1), width=4, anchor="center").grid(
+                row=f + 1, column=0
+            )
+
+        # celdas
+        for pos in posiciones:
+            f = int("".join(ch for ch in pos if ch.isdigit())) - 1
+            col_letra = "".join(ch for ch in pos if ch.isalpha())
+            c = _col_letra_a_indice(col_letra)
+            info = datos.get(pos)
+
+            if not info:
+                color = COLOR_PENDIENTE
+                texto = pos
+            else:
+                valor = info.get(criterio)
+                prefijo = "✓ " if info.get("separada") else ""
+                texto = prefijo + (valor if valor else "N/D")
+                color = color_map.get(valor, COLOR_SIN_MATCH) if valor else COLOR_ESCANEADO
+
+            lbl = tk.Label(
+                self.frame_grid_separacion, text=texto, width=14, height=2,
+                relief="ridge", bg=color, wraplength=100, font=("Segoe UI", 8),
+            )
+            lbl.grid(row=f + 1, column=c + 1, padx=2, pady=2)
+            self.celdas_sep[pos] = lbl
+
+        # leyenda
+        self._dibujar_leyenda_separacion(color_map)
+
+    def _dibujar_leyenda_separacion(self, mapa_color):
+        for w in self.frame_leyenda_sep.winfo_children():
+            w.destroy()
+        if not mapa_color:
+            ttk.Label(self.frame_leyenda_sep, text="(sin datos importados)").pack(padx=8, pady=8)
+            return
+        for nombre, color in mapa_color.items():
+            fila = ttk.Frame(self.frame_leyenda_sep)
+            fila.pack(fill="x", padx=6, pady=2)
+            tk.Label(fila, bg=color, width=2, height=1).pack(side="left")
+            ttk.Label(fila, text=nombre).pack(side="left", padx=6)
+
+    def _refrescar_picking_list(self):
+        for w in self.frame_picking.winfo_children():
+            w.destroy()
+
+        seleccion = self.combo_charola_sep.get()
+        if not seleccion:
+            ttk.Label(self.frame_picking, text="Selecciona una charola arriba.").pack(padx=10, pady=10)
+            return
+
+        charola_id = int(seleccion.split(" - ")[0])
+        self.charola_actual_id = charola_id
+        row = self.db.obtener_charola(charola_id)
+        if row:
+            _, _, self.filas, self.columnas, self.volteada_actual = row
+        grupos = self.db.pcbs_agrupados_por_modelo(charola_id, usar_modelo_base=self.usar_modelo_base.get())
+
+        if not grupos:
+            ttk.Label(
+                self.frame_picking,
+                text="Esta charola aun no tiene piezas clasificadas.\n"
+                     "Importa el Excel del ERP en la pestana 'Clasificacion / Excel' primero.",
+                justify="left",
+            ).pack(padx=10, pady=10, anchor="w")
+            return
+
+        for modelo, piezas in grupos.items():
+            total = len(piezas)
+            separadas = sum(1 for p in piezas if p["separada"])
+            titulo = f"Modelo: {modelo}   ({separadas}/{total} separadas)"
+            grupo_frame = ttk.LabelFrame(self.frame_picking, text=titulo)
+            grupo_frame.pack(fill="x", padx=6, pady=6, anchor="w")
+
+            barra = ttk.Frame(grupo_frame)
+            barra.pack(fill="x", pady=(2, 6))
+            ttk.Button(
+                barra, text="Marcar todas",
+                command=lambda cid=charola_id, m=modelo: self._marcar_grupo(cid, m, True),
+            ).pack(side="left", padx=4)
+            ttk.Button(
+                barra, text="Desmarcar todas",
+                command=lambda cid=charola_id, m=modelo: self._marcar_grupo(cid, m, False),
+            ).pack(side="left", padx=4)
+            ttk.Button(
+                barra, text="Copiar Lot ID de este grupo",
+                command=lambda piezas=piezas: self._copiar_grupo(piezas),
+            ).pack(side="left", padx=12)
+
+            for pieza in piezas:
+                var = tk.BooleanVar(value=pieza["separada"])
+                proceso_txt = pieza["proceso"] if pieza["proceso"] else "sin proceso"
+                texto = f'{pieza["posicion"]}   {pieza["lot_id"]}   ({proceso_txt})'
+                ttk.Checkbutton(
+                    grupo_frame, text=texto, variable=var,
+                    command=lambda cid=charola_id, pos=pieza["posicion"], var=var: self._toggle_separada(
+                        cid, pos, var
+                    ),
+                ).pack(anchor="w", padx=20, pady=1)
+
+        # redibuja el grid visual tras refrescar la lista de picking
+        self._dibujar_grid_separacion()
+
+    def _toggle_separada(self, charola_id, posicion, var):
+        self.db.marcar_separada(charola_id, posicion, var.get())
+        estado = "separada" if var.get() else "sin separar"
+        self.db.registrar_historial("separacion", f"charola {charola_id} pos {posicion} -> {estado}")
+        self._actualizar_titulos_picking()
+        self._redibujar_grid()
+        self._dibujar_grid_separacion()  # actualiza el grid visual de Separacion
+
+    def _marcar_grupo(self, charola_id, modelo, valor):
+        grupos = self.db.pcbs_agrupados_por_modelo(charola_id, usar_modelo_base=self.usar_modelo_base.get())
+        for pieza in grupos.get(modelo, []):
+            self.db.marcar_separada(charola_id, pieza["posicion"], valor)
+        estado = "todas separadas" if valor else "todas sin separar"
+        self.db.registrar_historial("separacion_grupo", f"charola {charola_id} modelo {modelo} -> {estado}")
+        self._refrescar_picking_list()
+        self._redibujar_grid()
+
+    def _actualizar_titulos_picking(self):
+        # simplemente redibuja toda la lista para refrescar los contadores (N/N separadas)
+        self._refrescar_picking_list()
+
+    def _copiar_grupo(self, piezas):
+        lot_ids = [p["lot_id"] for p in piezas]
+        if not lot_ids:
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lot_ids))
+        messagebox.showinfo("Copiado", f"{len(lot_ids)} Lot ID de este modelo copiados al portapapeles.")
+
+    def _construir_tab_modelos_base(self):
+        ttk.Label(
+            self.tab_modelos_base,
+            text=(
+                "Tabla de equivalencias: registra aqui como se reduce cada modelo variante a su "
+                "modelo base al relocalizar en InstalPCB (ej. 6L10 -> 6L). Confirma la regla exacta "
+                "con tu equipo antes de llenarla; mientras tanto, la separacion sigue funcionando "
+                "con el modelo tal cual lo entrega el ERP."
+            ),
+            wraplength=780, justify="left", foreground="#555555",
+        ).pack(anchor="w", padx=10, pady=10)
+
+        form = ttk.Frame(self.tab_modelos_base)
+        form.pack(fill="x", padx=10, pady=4)
+        ttk.Label(form, text="Modelo variante (ERP):").grid(row=0, column=0, sticky="w")
+        self.entry_variante = ttk.Entry(form, width=20)
+        self.entry_variante.grid(row=0, column=1, padx=6)
+        ttk.Label(form, text="Modelo base:").grid(row=0, column=2, sticky="w", padx=(15, 0))
+        self.entry_base = ttk.Entry(form, width=20)
+        self.entry_base.grid(row=0, column=3, padx=6)
+        ttk.Button(form, text="Agregar / actualizar", command=self._agregar_equivalencia).grid(
+            row=0, column=4, padx=10
+        )
+
+        cols = ("variante", "base")
+        self.tree_equivalencias = ttk.Treeview(self.tab_modelos_base, columns=cols, show="headings", height=12)
+        self.tree_equivalencias.heading("variante", text="Modelo variante")
+        self.tree_equivalencias.heading("base", text="Modelo base")
+        self.tree_equivalencias.column("variante", width=250)
+        self.tree_equivalencias.column("base", width=250)
+        self.tree_equivalencias.pack(fill="both", expand=True, padx=10, pady=10)
+
+        ttk.Button(self.tab_modelos_base, text="Eliminar seleccionada", command=self._eliminar_equivalencia).pack(
+            anchor="w", padx=10, pady=(0, 10)
+        )
+
+        self._refrescar_equivalencias()
+
+    def _agregar_equivalencia(self):
+        variante = self.entry_variante.get().strip()
+        base = self.entry_base.get().strip()
+        if not variante or not base:
+            messagebox.showwarning("Datos incompletos", "Ingresa el modelo variante y su modelo base.")
+            return
+        self.db.agregar_equivalencia(variante, base)
+        self.entry_variante.delete(0, tk.END)
+        self.entry_base.delete(0, tk.END)
+        self._refrescar_equivalencias()
+
+    def _eliminar_equivalencia(self):
+        seleccion = self.tree_equivalencias.selection()
+        if not seleccion:
+            return
+        variante = self.tree_equivalencias.item(seleccion[0], "values")[0]
+        self.db.eliminar_equivalencia(variante)
+        self._refrescar_equivalencias()
+
+    def _refrescar_equivalencias(self):
+        for item in self.tree_equivalencias.get_children():
+            self.tree_equivalencias.delete(item)
+        for variante, base in self.db.listar_equivalencias():
+            self.tree_equivalencias.insert("", "end", values=(variante, base))
+
+    def _construir_tab_historial(self):
+        cols = ("evento", "detalle", "fecha")
+        self.tree_historial = ttk.Treeview(self.tab_historial, columns=cols, show="headings")
+        for c, w in zip(cols, (150, 500, 160)):
+            self.tree_historial.heading(c, text=c.capitalize())
+            self.tree_historial.column(c, width=w)
+        self.tree_historial.pack(fill="both", expand=True, padx=10, pady=10)
+        ttk.Button(self.tab_historial, text="Actualizar", command=self._refrescar_historial).pack(pady=4)
+        self._refrescar_historial()
+
+    # ---------------- Charolas ----------------
+    def _dialogo_nueva_charola(self):
+        ventana = tk.Toplevel(self)
+        ventana.title("Nueva charola")
+        ventana.geometry("300x220")
+
+        ttk.Label(ventana, text="Nombre / ID de charola:").pack(pady=(10, 0))
+        entry_nombre = ttk.Entry(ventana)
+        entry_nombre.pack(pady=4)
+
+        ttk.Label(ventana, text="Tamano:").pack(pady=(10, 0))
+        combo_tamano = ttk.Combobox(
+            ventana, state="readonly",
+            values=["36 (6x6)", "48 (6x8)", "48 (8x6)", "Personalizado"],
+        )
+        combo_tamano.current(0)
+        combo_tamano.pack(pady=4)
+
+        volteada_var = tk.BooleanVar(value=True)  # 36 (6x6) suele ir con QR boca abajo
+        chk_volteada = ttk.Checkbutton(
+            ventana,
+            text="Charola volteada (QR boca abajo, tipico en charolas de 36)",
+            variable=volteada_var,
+        )
+        chk_volteada.pack(pady=(8, 0))
+
+        frame_custom = ttk.Frame(ventana)
+        entry_f = ttk.Entry(frame_custom, width=5)
+        entry_c = ttk.Entry(frame_custom, width=5)
+
+        def on_tamano_change(event=None):
+            seleccion = combo_tamano.get()
+            if seleccion == "Personalizado":
+                frame_custom.pack(pady=4)
+                ttk.Label(frame_custom, text="Filas:").grid(row=0, column=0)
+                entry_f.grid(row=0, column=1, padx=4)
+                ttk.Label(frame_custom, text="Columnas:").grid(row=0, column=2)
+                entry_c.grid(row=0, column=3, padx=4)
+            else:
+                frame_custom.pack_forget()
+            # sugerencia automatica: 36 (6x6) casi siempre va volteada; las demas, no
+            volteada_var.set(seleccion == "36 (6x6)")
+
+        combo_tamano.bind("<<ComboboxSelected>>", on_tamano_change)
+
+        def confirmar():
+            nombre = entry_nombre.get().strip()
+            if not nombre:
+                messagebox.showwarning("Falta nombre", "Ingresa un nombre o ID para la charola.")
+                return
+            seleccion = combo_tamano.get()
+            if seleccion == "36 (6x6)":
+                filas, columnas = 6, 6
+            elif seleccion == "48 (6x8)":
+                filas, columnas = 6, 8
+            elif seleccion == "48 (8x6)":
+                filas, columnas = 8, 6
+            else:
+                try:
+                    filas, columnas = int(entry_f.get()), int(entry_c.get())
+                except ValueError:
+                    messagebox.showwarning("Tamano invalido", "Filas y columnas deben ser numeros.")
+                    return
+            try:
+                nueva_id = self.db.crear_charola(nombre, filas, columnas, volteada_var.get())
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Error", "Ya existe una charola con ese nombre.")
+                return
+            ventana.destroy()
+            self._refrescar_combo_charolas()
+            self.combo_charola.set(f"{nueva_id} - {nombre}")
+            self._on_seleccionar_charola()
+
+        ttk.Button(ventana, text="Crear", command=confirmar).pack(pady=15)
+
+    def _refrescar_combo_charolas(self):
+        charolas = self.db.listar_charolas()
+        valores = [f"{cid} - {nombre} ({f}x{c})" for cid, nombre, f, c, _v in charolas]
+        self.combo_charola["values"] = valores
+        if hasattr(self, "combo_charola_sep"):
+            self.combo_charola_sep["values"] = valores
+        if valores and not self.combo_charola.get():
+            self.combo_charola.current(0)
+            self._on_seleccionar_charola()
+
+    def _on_seleccionar_charola(self, event=None):
+        seleccion = self.combo_charola.get()
+        if not seleccion:
+            return
+        charola_id = int(seleccion.split(" - ")[0])
+        row = self.db.obtener_charola(charola_id)
+        if not row:
+            return
+        _, _, filas, columnas, volteada = row
+        self.charola_actual_id = charola_id
+        self.filas, self.columnas = filas, columnas
+        self.volteada_actual = volteada
+        self._dibujar_grid()
+
+    # ---------------- Grid / escaneo ----------------
+    def _dibujar_grid(self):
+        for w in self.frame_grid.winfo_children():
+            w.destroy()
+        self.celdas = {}
+        if self.charola_actual_id is None:
+            return
+
+        posiciones = generar_posiciones(self.filas, self.columnas)
+        datos = self.db.pcbs_de_charola(self.charola_actual_id)
+
+        # encabezados de columna
+        for c in range(self.columnas):
+            ttk.Label(self.frame_grid, text=etiqueta_columna(c), width=10, anchor="center").grid(
+                row=0, column=c + 1
+            )
+        for f in range(self.filas):
+            ttk.Label(self.frame_grid, text=str(f + 1), width=4, anchor="center").grid(row=f + 1, column=0)
+
+        for pos in posiciones:
+            f = int("".join(ch for ch in pos if ch.isdigit())) - 1
+            col_letra = "".join(ch for ch in pos if ch.isalpha())
+            c = _col_letra_a_indice(col_letra)
+            info = datos.get(pos)
+            color = COLOR_ESCANEADO if info else COLOR_PENDIENTE
+            texto = info["lot_id"] if info else pos
+            lbl = tk.Label(
+                self.frame_grid, text=texto, width=12, height=2, relief="ridge",
+                bg=color, wraplength=90, font=("Segoe UI", 8),
+            )
+            lbl.grid(row=f + 1, column=c + 1, padx=2, pady=2)
+            self.celdas[pos] = lbl
+
+        total = len(posiciones)
+        escaneadas = len(datos)
+        nota_volteo = "  |  Modo VOLTEADA: fila = (filas+1)-fila, columna igual" if self.volteada_actual else ""
+        self.lbl_progreso.config(text=f"{escaneadas} / {total} posiciones escaneadas{nota_volteo}")
+
+    def _siguiente_posicion_libre(self):
+        """
+        Devuelve la siguiente posicion CANONICA a llenar, siguiendo el orden
+        fisico de escaneo. Si la charola esta volteada, ya viene traducida
+        (ver orden_escaneo / voltear_posicion).
+        """
+        secuencia = orden_escaneo(self.filas, self.columnas, self.volteada_actual)
+        datos = self.db.pcbs_de_charola(self.charola_actual_id)
+        for pos in secuencia:
+            if pos not in datos:
+                return pos
+        return None
+
+    def _escanear(self):
+        if self.charola_actual_id is None:
+            messagebox.showwarning("Sin charola", "Selecciona o crea una charola primero.")
+            return
+        lot_id = self.entry_lot_id.get().strip()
+        self.entry_lot_id.delete(0, tk.END)
+        if not lot_id:
+            return
+
+        # Validacion 1: duplicado en cualquier parte del sistema
+        existente = self.db.lot_id_ya_escaneado(lot_id)
+        if existente:
+            charola_id, pos = existente
+            messagebox.showerror(
+                "Lot ID duplicado",
+                f"Este Lot ID ya fue escaneado antes (charola {charola_id}, posicion {pos}).",
+            )
+            return
+
+        # Validacion 2: orden estricto si esta activado
+        siguiente = self._siguiente_posicion_libre()
+        if siguiente is None:
+            messagebox.showinfo("Charola completa", "Todas las posiciones ya fueron escaneadas.")
+            return
+
+        posicion = siguiente
+        if not self.orden_estricto.get():
+            # sin orden estricto igual usamos la siguiente libre automaticamente,
+            # esto evita que el operador tenga que capturar posicion a mano
+            pass
+
+        self.db.escanear(self.charola_actual_id, posicion, lot_id)
+        self._dibujar_grid()
+
+    def _undo_celda(self):
+        if self.charola_actual_id is None:
+            return
+        datos = self.db.pcbs_de_charola(self.charola_actual_id)
+        if not datos:
+            return
+        # deshace la ultima posicion ocupada, respetando el orden fisico de escaneo
+        secuencia = orden_escaneo(self.filas, self.columnas, self.volteada_actual)
+        ocupadas = [p for p in secuencia if p in datos]
+        if not ocupadas:
+            return
+        ultima = ocupadas[-1]
+        confirm = messagebox.askyesno("Confirmar", f"Deshacer escaneo de la posicion {ultima}?")
+        if confirm:
+            self.db.undo_ultimo_escaneo(self.charola_actual_id, ultima)
+            self._dibujar_grid()
+
+    def _copiar_lot_ids(self):
+        if self.charola_actual_id is None:
+            return
+        datos = self.db.pcbs_de_charola(self.charola_actual_id)
+        lot_ids = [info["lot_id"] for info in datos.values()]
+        if not lot_ids:
+            messagebox.showinfo("Sin datos", "No hay Lot ID escaneados en esta charola.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lot_ids))
+        messagebox.showinfo("Copiado", f"{len(lot_ids)} Lot ID copiados al portapapeles.")
+
+    # ---------------- Importar Excel / clasificacion ----------------
+    def _importar_excel(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
+        if not path:
+            return
+        try:
+            df = pd.read_excel(path)
+        except Exception as exc:
+            messagebox.showerror("Error al leer Excel", str(exc))
+            return
+
+        columnas_lower = {c.lower().strip(): c for c in df.columns}
+        col_lot = _buscar_columna(columnas_lower, ["lot id", "lot_id", "lotid"])
+        col_modelo = _buscar_columna(columnas_lower, ["modelo", "model", "product", "producto"])
+        col_proceso = _buscar_columna(
+            columnas_lower,
+            ["proceso", "process", "process name", "estacion", "station", "wip status name"],
+        )
+
+        if not col_lot:
+            messagebox.showerror(
+                "Columnas no encontradas",
+                "No se encontro una columna de Lot ID en el Excel. "
+                "Se esperaba algo como 'Lot ID', 'LotID' o similar.",
+            )
+            return
+
+        actualizados = 0
+        no_encontrados = []
+        lot_ids_sistema = set(self.db.todos_los_lot_ids())
+
+        for _, row in df.iterrows():
+            lot_id = str(row[col_lot]).strip()
+            if lot_id not in lot_ids_sistema:
+                no_encontrados.append(lot_id)
+                continue
+            modelo = str(row[col_modelo]).strip() if col_modelo else "N/D"
+            proceso = str(row[col_proceso]).strip() if col_proceso else "N/D"
+            if self.db.actualizar_modelo_proceso(lot_id, modelo, proceso):
+                actualizados += 1
+
+        self.db.registrar_historial(
+            "excel_importado", f"{os.path.basename(path)}: {actualizados} actualizados, {len(no_encontrados)} sin match"
+        )
+
+        estado = f"Importado: {actualizados} PCBs actualizados."
+        if no_encontrados:
+            estado += f" {len(no_encontrados)} Lot ID del Excel no estaban escaneados en el sistema."
+        self.lbl_import_status.config(text=estado)
+
+        self._recalcular_colores()
+        self._redibujar_grid()
+        self._refrescar_historial()
+
+    def _recalcular_colores(self):
+        """Asigna un color fijo de la paleta a cada modelo y a cada proceso nuevos."""
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT DISTINCT modelo FROM pcbs WHERE modelo IS NOT NULL")
+        for (modelo,) in cur.fetchall():
+            if modelo not in self.color_map_modelo:
+                self.color_map_modelo[modelo] = COLOR_PALETTE[len(self.color_map_modelo) % len(COLOR_PALETTE)]
+        cur.execute("SELECT DISTINCT proceso FROM pcbs WHERE proceso IS NOT NULL")
+        for (proceso,) in cur.fetchall():
+            if proceso not in self.color_map_proceso:
+                self.color_map_proceso[proceso] = COLOR_PALETTE[len(self.color_map_proceso) % len(COLOR_PALETTE)]
+
+    def _redibujar_grid(self):
+        """Recolorea el grid de la charola actual segun la vista activa (modelo/proceso)."""
+        if self.charola_actual_id is None or not self.celdas:
+            return
+        datos = self.db.pcbs_de_charola(self.charola_actual_id)
+        criterio = self.vista_color.get()
+        mapa_color = self.color_map_modelo if criterio == "modelo" else self.color_map_proceso
+
+        for pos, lbl in self.celdas.items():
+            info = datos.get(pos)
+            if not info:
+                lbl.config(bg=COLOR_PENDIENTE, text=pos)
+                continue
+            prefijo = "\u2713 " if info.get("separada") else ""
+            texto = prefijo + info["lot_id"]
+            valor = info.get(criterio)
+            if valor and valor in mapa_color:
+                lbl.config(bg=mapa_color[valor], text=texto)
+            elif info.get("modelo") is None and info.get("proceso") is None:
+                lbl.config(bg=COLOR_ESCANEADO, text=texto)
+            else:
+                lbl.config(bg=COLOR_SIN_MATCH, text=texto)
+
+        self._dibujar_leyenda(mapa_color)
+
+    def _dibujar_leyenda(self, mapa_color):
+        for w in self.frame_leyenda.winfo_children():
+            w.destroy()
+        if not mapa_color:
+            ttk.Label(self.frame_leyenda, text="(sin datos importados)").pack(padx=8, pady=8)
+            return
+        for nombre, color in mapa_color.items():
+            fila = ttk.Frame(self.frame_leyenda)
+            fila.pack(fill="x", padx=6, pady=2)
+            tk.Label(fila, bg=color, width=2, height=1).pack(side="left")
+            ttk.Label(fila, text=nombre).pack(side="left", padx=6)
+
+    # ---------------- Historial ----------------
+    def _refrescar_historial(self):
+        for item in self.tree_historial.get_children():
+            self.tree_historial.delete(item)
+        for evento, detalle, fecha in self.db.leer_historial():
+            self.tree_historial.insert("", "end", values=(evento, detalle, fecha))
+
+
+def _col_letra_a_indice(letras):
+    idx = 0
+    for ch in letras:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def _buscar_columna(columnas_lower, candidatos):
+    for cand in candidatos:
+        if cand in columnas_lower:
+            return columnas_lower[cand]
+    return None
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
