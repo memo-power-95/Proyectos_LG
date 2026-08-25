@@ -1179,6 +1179,51 @@ class App(tk.Tk):
         nota_bloqueadas = f"  |  {bloqueadas_count} posiciones bloqueadas" if bloqueadas_count > 0 else ""
         self.lbl_progreso.config(text=f"{escaneadas} / {total} posiciones escaneadas{nota_volteo}{nota_bloqueadas}")
 
+    def _escanear(self):
+        if self.charola_actual_id is None:
+            messagebox.showwarning("Sin charola", "Selecciona o crea una charola primero.")
+            return
+        
+        lot_id = self.entry_lot_id.get().strip()
+        self.entry_lot_id.delete(0, tk.END)
+        if not lot_id:
+            return
+        
+        # Validacion 1: formato válido (solo alfanuméricos y guiones)
+        if not all(c.isalnum() or c in '-_' for c in lot_id):
+            messagebox.showerror("Formato inválido", "Lot ID contiene caracteres no válidos.")
+            return
+
+        # Validacion 2: duplicado en cualquier parte del sistema
+        existente = self.db.lot_id_ya_escaneado(lot_id)
+        if existente:
+            charola_id, pos = existente
+            messagebox.showerror(
+                "Lot ID duplicado",
+                f"Este Lot ID ya fue escaneado antes\n(charola {charola_id}, posición {pos}).",
+            )
+            return
+
+        # Validacion 3: obtener siguiente posición libre
+        siguiente = self._siguiente_posicion_libre()
+        if siguiente is None:
+            messagebox.showinfo("Charola completa", "Todas las posiciones ya fueron escaneadas o están bloqueadas.")
+            return
+
+        # Validacion 4: posición no está bloqueada
+        posiciones_bloqueadas = self.db.posiciones_bloqueadas_de_charola(self.charola_actual_id)
+        if siguiente in posiciones_bloqueadas:
+            messagebox.showerror(
+                "Posición bloqueada",
+                f"La posición {siguiente} está bloqueada y no puede ser escaneada.",
+            )
+            return
+
+        posicion = siguiente
+        self.db.escanear(self.charola_actual_id, posicion, lot_id)
+        self._dibujar_grid()
+        self.entry_lot_id.focus()
+
     def _siguiente_posicion_libre(self):
         """
         Devuelve la siguiente posicion CANONICA a llenar, siguiendo el orden
@@ -1306,51 +1351,6 @@ class App(tk.Tk):
         ttk.Button(btn_frame, text="✓ Confirmar y mapear", command=confirmar).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="✗ Cancelar", command=ventana_preview.destroy).pack(side="left", padx=4)
         ttk.Label(btn_frame, text="Si se ve bien, confirma. Si no, cancela y revisa el formato.", foreground="#666").pack(side="left", padx=20)
-
-    def _copiar_lot_ids(self):
-        if self.charola_actual_id is None:
-            messagebox.showwarning("Sin charola", "Selecciona o crea una charola primero.")
-            return
-        
-        lot_id = self.entry_lot_id.get().strip()
-        self.entry_lot_id.delete(0, tk.END)
-        if not lot_id:
-            return
-        
-        # Validacion 1: formato válido (solo alfanuméricos y guiones)
-        if not all(c.isalnum() or c in '-_' for c in lot_id):
-            messagebox.showerror("Formato inválido", "Lot ID contiene caracteres no válidos.")
-            return
-
-        # Validacion 2: duplicado en cualquier parte del sistema
-        existente = self.db.lot_id_ya_escaneado(lot_id)
-        if existente:
-            charola_id, pos = existente
-            messagebox.showerror(
-                "Lot ID duplicado",
-                f"Este Lot ID ya fue escaneado antes\n(charola {charola_id}, posición {pos}).",
-            )
-            return
-
-        # Validacion 3: obtener siguiente posición libre
-        siguiente = self._siguiente_posicion_libre()
-        if siguiente is None:
-            messagebox.showinfo("Charola completa", "Todas las posiciones ya fueron escaneadas o están bloqueadas.")
-            return
-
-        # Validacion 4: posición no está bloqueada
-        posiciones_bloqueadas = self.db.posiciones_bloqueadas_de_charola(self.charola_actual_id)
-        if siguiente in posiciones_bloqueadas:
-            messagebox.showerror(
-                "Posición bloqueada",
-                f"La posición {siguiente} está bloqueada y no puede ser escaneada.",
-            )
-            return
-
-        posicion = siguiente
-        self.db.escanear(self.charola_actual_id, posicion, lot_id)
-        self._dibujar_grid()
-        self.entry_lot_id.focus()
 
     def _undo_celda(self):
         if self.charola_actual_id is None:
