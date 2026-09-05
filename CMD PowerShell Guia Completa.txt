@@ -1,0 +1,353 @@
+===============================================
+GUÍA COMPLETA: COMANDOS CMD Y POWERSHELL
+===============================================
+
+NAVEGACIÓN Y DIRECTORIOS
+===============================================
+
+CMD:
+  cd                        Ver carpeta actual
+  cd carpeta                Entrar a una carpeta
+  cd ..                     Subir una carpeta
+  cd \                      Ir a raíz del disco
+  cd /d D:\ruta             Cambiar de disco y carpeta
+  D:                        Cambiar a disco D
+  dir                       Listar archivos y carpetas
+  dir /S                    Listar recursivo (incluyendo subcarpetas)
+  dir /B                    Listar solo nombres
+  tree                      Ver estructura en árbol
+  tree /F                   Ver estructura con archivos
+
+POWERSHELL:
+  Get-Location              Ver carpeta actual (alias: pwd)
+  Set-Location C:\ruta      Cambiar de carpeta (alias: cd)
+  Get-ChildItem             Listar contenido (alias: ls, dir)
+  Get-ChildItem -Recurse    Listar recursivo
+  Push-Location             Guardar ubicación actual
+  Pop-Location              Volver a ubicación anterior
+
+===============================================
+VER Y BUSCAR ARCHIVOS
+===============================================
+
+CMD:
+  dir *.csv                 Buscar archivos CSV
+  dir /S *.csv              Buscar CSV en todas las carpetas
+  findstr /R "texto" *.txt  Buscar texto en archivos
+  where archivo.exe         Buscar archivo en PATH
+  dir C:\ /S               Listar todo disco C
+
+POWERSHELL:
+  Get-ChildItem -Filter "*.csv"
+                            Buscar archivos CSV
+  Get-ChildItem -Recurse -Filter "*.csv"
+                            Buscar CSV recursivo
+  Get-ChildItem -Filter "*.txt" | Select-Object Name, Length
+                            Listar TXT con tamaño
+  Search-String "texto" *.txt
+                            Buscar texto en archivos
+
+===============================================
+ELIMINAR ARCHIVOS Y CARPETAS
+===============================================
+
+CMD:
+  del archivo.txt           Eliminar archivo
+  del *.csv                 Eliminar todos los CSV
+  del /P *.csv              Eliminar con confirmación
+  del /Q *.csv              Eliminar sin confirmación
+  del /S *.csv              Eliminar en subcarpetas
+  rmdir carpeta             Eliminar carpeta vacía
+  rmdir /S carpeta          Eliminar carpeta y contenido
+  rmdir /S /Q carpeta       Eliminar sin confirmación
+  forfiles /M "*.csv" /D -30 /C "cmd /c del @file"
+                            Eliminar archivos de últimos 30 días
+
+POWERSHELL:
+  Remove-Item archivo.txt   Eliminar archivo
+  Remove-Item "*.csv"       Eliminar CSV
+  Remove-Item -Recurse carpeta
+                            Eliminar carpeta y contenido
+  Remove-Item -Force archivo.txt
+                            Forzar eliminación
+  Get-ChildItem "*.csv" | Remove-Item
+                            Pipeline: listar y eliminar
+
+===============================================
+CREAR ARCHIVOS Y CARPETAS
+===============================================
+
+CMD:
+  mkdir carpeta             Crear carpeta
+  mkdir C:\ruta\carpeta     Crear carpeta en ruta
+  copy archivo1.txt archivo2.txt
+                            Copiar archivo
+  move archivo.txt nueva_ruta\
+                            Mover archivo
+  ren archivo_viejo.txt archivo_nuevo.txt
+                            Renombrar archivo
+  type archivo.txt          Ver contenido de archivo
+  echo texto > archivo.txt  Crear archivo con texto
+
+POWERSHELL:
+  New-Item -ItemType Directory -Name carpeta
+                            Crear carpeta
+  New-Item -ItemType File -Name archivo.txt
+                            Crear archivo
+  Copy-Item archivo1.txt archivo2.txt
+                            Copiar archivo
+  Move-Item archivo.txt nueva_ruta\
+                            Mover archivo
+  Rename-Item archivo_viejo.txt archivo_nuevo.txt
+                            Renombrar
+  Get-Content archivo.txt   Ver contenido
+  Set-Content archivo.txt "texto"
+                            Crear/escribir archivo
+
+===============================================
+VER TAMAÑO DE ARCHIVOS Y DISCO
+===============================================
+
+CMD:
+  dir "C:\ruta" /S          Ver tamaño de carpeta
+  tree "C:\ruta" /A /S      Ver estructura con tamaño
+  fsutil volume diskfree C: Ver espacio libre disco C
+
+POWERSHELL:
+  Get-ChildItem -Recurse | Measure-Object -Property Length -Sum
+                            Ver tamaño total carpeta
+  Get-ChildItem "C:\" -Directory | ForEach-Object {$size = (Get-ChildItem $_.FullName -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; [PSCustomObject]@{Carpeta=$_.Name; "Tamaño (GB)"=[math]::Round($size/1GB,2)}} | Sort-Object "Tamaño (GB)" -Descending | Select-Object -First 20
+                            Top 20 carpetas por tamaño
+  Get-ChildItem -Recurse -File | Sort-Object Length -Descending | Select-Object -First 10 FullName, @{Name="Tamaño (MB)"; Expression={[math]::Round($_.Length/1MB,2)}}
+                            Top 10 archivos más grandes
+  Get-Volume | Select-Object DriveLetter, @{Name="Total (GB)"; Expression={[math]::Round($_.Size/1GB,2)}}, @{Name="Libre (GB)"; Expression={[math]::Round($_.SizeRemaining/1GB,2)}}
+                            Espacio disco resumido
+
+===============================================
+INFORMACIÓN DEL SISTEMA
+===============================================
+
+CMD:
+  systeminfo                Ver información del sistema
+  wmic logicaldisk get name,size,freespace
+                            Ver discos y espacio
+  tasklist                  Ver procesos en ejecución
+  wmic os get caption       Ver versión Windows
+  ipconfig                  Ver configuración de red
+  ipconfig /all             Ver detalles de red
+
+POWERSHELL:
+  Get-ComputerInfo          Ver información del sistema
+  Get-Volume                Ver discos
+  Get-Process               Ver procesos
+  Get-WmiObject Win32_ComputerSystem
+                            Info detallada del sistema
+  Test-NetConnection host   Probar conexión de red
+  Get-NetIPAddress          Ver direcciones IP
+
+===============================================
+PERMISOS Y PROPIEDADES
+===============================================
+
+CMD:
+  attrib archivo.txt        Ver atributos de archivo
+  attrib +R archivo.txt     Marcar como solo lectura
+  attrib -R archivo.txt     Quitar solo lectura
+  cacls carpeta /E /G Usuario:F
+                            Dar permisos a usuario
+  icacls carpeta /grant Usuario:F
+                            Dar control total
+
+POWERSHELL:
+  Get-Item archivo.txt | Select-Object Attributes
+                            Ver atributos
+  (Get-Item archivo.txt).Attributes = "Archive"
+                            Cambiar atributos
+  Get-Acl archivo.txt       Ver permisos
+  Set-Acl -Path archivo.txt -AclObject $acl
+                            Cambiar permisos
+
+===============================================
+PROCESOS Y SERVICIOS
+===============================================
+
+CMD:
+  tasklist                  Listar procesos
+  tasklist /v               Listar procesos detallado
+  taskkill /IM proceso.exe  Matar proceso
+  taskkill /PID 1234        Matar por PID
+  net start servicio        Iniciar servicio
+  net stop servicio         Detener servicio
+  sc query                  Ver servicios
+
+POWERSHELL:
+  Get-Process               Listar procesos
+  Get-Process | Where-Object {$_.Name -like "*excel*"}
+                            Filtrar procesos
+  Stop-Process -Name proceso.exe
+                            Detener proceso
+  Start-Service servicio    Iniciar servicio
+  Stop-Service servicio     Detener servicio
+  Get-Service               Ver todos los servicios
+
+===============================================
+ARCHIVOS COMPRIMIDOS
+===============================================
+
+CMD:
+  (No hay comando nativo simple en CMD)
+  7z a archivo.7z archivos/ (usando 7-Zip)
+  rar a archivo.rar archivos/ (usando WinRAR)
+
+POWERSHELL:
+  Compress-Archive -Path "ruta" -DestinationPath "archivo.zip"
+                            Crear ZIP
+  Expand-Archive -Path "archivo.zip" -DestinationPath "ruta"
+                            Extraer ZIP
+  Expand-Archive "archivo.zip"
+                            Extraer en carpeta actual
+
+===============================================
+BUSCAR Y REEMPLAZAR TEXTO
+===============================================
+
+CMD:
+  findstr "texto" archivo.txt
+                            Buscar texto en archivo
+  findstr /R "patron" archivo.txt
+                            Buscar con expresión regular
+  findstr /S "texto" *.txt  Buscar en todos TXT
+
+POWERSHELL:
+  Select-String -Path "archivo.txt" -Pattern "texto"
+                            Buscar texto
+  Select-String -Path "*.txt" -Pattern "texto" -Recurse
+                            Buscar recursivo en TXT
+  (Get-Content archivo.txt) -replace "viejo","nuevo" | Set-Content archivo.txt
+                            Buscar y reemplazar
+
+===============================================
+VARIABLES Y SCRIPTING
+===============================================
+
+CMD:
+  set VARIABLE=valor        Crear variable
+  echo %VARIABLE%           Ver variable
+  set                       Ver todas las variables
+  if %VARIABLE%==valor (comando)
+                            Condición IF
+  for %i in (1,2,3) do echo %i
+                            Loop FOR
+
+POWERSHELL:
+  $variable = "valor"       Crear variable
+  $variable                 Ver variable
+  Get-Variable              Ver todas las variables
+  if ($variable -eq "valor") { comando }
+                            Condición IF
+  foreach ($i in 1..10) { $i }
+                            Loop FOR
+  1..10 | ForEach-Object { $_ }
+                            Loop con pipeline
+
+===============================================
+COPIAS DE SEGURIDAD Y SINCRONIZACIÓN
+===============================================
+
+CMD:
+  robocopy "origen" "destino"
+                            Copiar archivos (robusto)
+  robocopy "origen" "destino" /MIR
+                            Sincronizar carpetas
+  xcopy "origen\*" "destino\" /S /E /Y
+                            Copiar recursivo
+
+POWERSHELL:
+  Copy-Item -Path "origen" -Destination "destino" -Recurse
+                            Copiar recursivo
+  Get-ChildItem "origen" -Recurse | Copy-Item -Destination "destino"
+                            Copiar con pipeline
+
+===============================================
+FECHA Y HORA
+===============================================
+
+CMD:
+  date /T                   Ver fecha
+  time /T                   Ver hora
+  echo %date%               Mostrar fecha en variable
+  echo %time%               Mostrar hora en variable
+
+POWERSHELL:
+  Get-Date                  Ver fecha y hora actual
+  Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                            Formato personalizado
+  (Get-Date).AddDays(30)    Fecha + 30 días
+  (Get-Date).Year           Obtener año
+
+===============================================
+MONITOREO Y MANTENIMIENTO
+===============================================
+
+CMD:
+  chkdsk C:                 Verificar disco
+  chkdsk C: /F              Reparar disco (requiere reinicio)
+  defrag C:                 Desfragmentar disco
+  cleanmgr                  Limpiar disco
+
+POWERSHELL:
+  Get-Volume | Select-Object DriveLetter, FileSystem, Health
+                            Estado de volúmenes
+  Get-EventLog -LogName System -Newest 10
+                            Ver eventos del sistema
+
+===============================================
+COMBINACIONES ÚTILES (PIPELINES POWERSHELL)
+===============================================
+
+Ver archivos CSV grandes:
+  Get-ChildItem -Recurse -Filter "*.csv" | Sort-Object Length -Descending | Select-Object -First 5 FullName, @{Name="Tamaño (MB)"; Expression={[math]::Round($_.Length/1MB,2)}}
+
+Contar archivos por tipo:
+  Get-ChildItem -Recurse | Group-Object Extension | Select-Object Name, Count
+
+Eliminar archivos mayores a 100MB:
+  Get-ChildItem -Recurse -File | Where-Object {$_.Length -gt 100MB} | Remove-Item
+
+Buscar archivos modificados hoy:
+  Get-ChildItem -Recurse | Where-Object {$_.LastWriteTime -gt (Get-Date).Date}
+
+Crear lista de archivos en TXT:
+  Get-ChildItem -Recurse | Select-Object FullName | Export-Csv "lista.csv" -NoTypeInformation
+
+===============================================
+ATAJOS ÚTILES
+===============================================
+
+CMD:
+  Flecha arriba/abajo       Historial de comandos
+  Tab                       Autocompletar
+  Ctrl + C                  Cancelar comando
+
+POWERSHELL:
+  Tab                       Autocompletar
+  Ctrl + R                  Buscar en historial
+  Get-Help comando          Ver ayuda de comando
+  Get-Help comando -Examples
+                            Ver ejemplos
+
+===============================================
+INICIAR POWERSHELL DESDE CMD
+===============================================
+
+  powershell                Abrir PowerShell
+  powershell -NoProfile     Abrir sin perfil
+  powershell -Command "Get-ChildItem"
+                            Ejecutar comando directamente
+
+===============================================
+INICIAR CMD DESDE POWERSHELL
+===============================================
+
+  cmd                       Abrir CMD
+  cmd /c "comando"          Ejecutar comando y cerrar
